@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.standalone_ar.hybrid_replay import HybridDraftReplay
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -63,6 +64,7 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         )
         self.expanded_slot_mappings: torch.Tensor
         self.supports_mm_inputs = False
+        self.hybrid_replay: HybridDraftReplay | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass  # CUDA graph not yet supported for standalone AR speculator.
@@ -121,10 +123,12 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         )
         self._draft_vllm_config = draft_vllm_config
         with set_model_tag("draft_model"):
-            return get_model(
+            model = get_model(
                 vllm_config=draft_vllm_config,
                 prefix="draft_model",
             )
+        self.hybrid_replay = HybridDraftReplay(self, model)
+        return model
 
     @torch.inference_mode()
     def _run_model(
@@ -168,6 +172,8 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         self,
         input_batch: InputBatch,
         num_rejected: torch.Tensor,
+        num_sampled: torch.Tensor,
+        use_hybrid_replay: bool,
         last_sampled: torch.Tensor,
         num_reqs: int,
         skip_attn: bool,
@@ -192,42 +198,56 @@ class StandaloneARSpeculator(DraftModelSpeculator):
             assert block_tables is not None
             assert kv_cache_config is not None
 
-            total_expanded = prepare_prefill_inputs(
-                input_buffers=self.input_buffers,
-                input_batch=input_batch,
-                last_sampled=last_sampled,
-                num_rejected=num_rejected,
-                expanded_input_ids=self.expanded_input_ids,
-                expanded_positions=self.expanded_positions,
-                last_token_indices=self.last_token_indices,
-                max_num_reqs=self.max_num_reqs,
-                max_model_len=self.max_model_len,
-            )
+            if use_hybrid_replay:
+                total_expanded, hybrid_qsl, _ = self.hybrid_replay.prepare(
+                    input_batch, num_rejected, num_sampled, last_sampled
+                )
+            else:
+                total_expanded = prepare_prefill_inputs(
+                    input_buffers=self.input_buffers,
+                    input_batch=input_batch,
+                    last_sampled=last_sampled,
+                    num_rejected=num_rejected,
+                    expanded_input_ids=self.expanded_input_ids,
+                    expanded_positions=self.expanded_positions,
+                    last_token_indices=self.last_token_indices,
+                    max_num_reqs=self.max_num_reqs,
+                    max_model_len=self.max_model_len,
+                )
 
             prefill_slot_mappings = block_tables.compute_slot_mappings(
-                input_batch.idx_mapping,
+                (
+                    input_batch.idx_mapping[self.hybrid_replay.order]
+                    if use_hybrid_replay
+                    else input_batch.idx_mapping
+                ),
                 self.input_buffers.query_start_loc[: num_reqs + 1],
                 self.expanded_positions[:total_expanded],
                 total_expanded,
                 out=self.expanded_slot_mappings,
             )
-            qsl_np = input_batch.query_start_loc_np
-            query_start_loc_cpu_expanded = (
-                torch.from_numpy(qsl_np[: num_reqs + 1]).int()
-                + torch.from_numpy(self.arange_np[: num_reqs + 1]).int()
-            )
-            prefill_attn_md = self._build_attn_metadata(
-                batch_desc=BatchExecutionDescriptor(
-                    cg_mode=CUDAGraphMode.NONE,
-                    num_tokens=total_expanded,
+            if use_hybrid_replay:
+                prefill_attn_md = self.hybrid_replay.metadata(
+                    hybrid_qsl, prefill_slot_mappings
+                )
+            else:
+                qsl_np = input_batch.query_start_loc_np
+                query_start_loc_cpu_expanded = (
+                    torch.from_numpy(qsl_np[: num_reqs + 1]).int()
+                    + torch.from_numpy(self.arange_np[: num_reqs + 1]).int()
+                )
+                prefill_attn_md = self._build_attn_metadata(
+                    batch_desc=BatchExecutionDescriptor(
+                        cg_mode=CUDAGraphMode.NONE,
+                        num_tokens=total_expanded,
+                        num_reqs=num_reqs,
+                    ),
                     num_reqs=num_reqs,
-                ),
-                num_reqs=num_reqs,
-                query_start_loc_np=query_start_loc_cpu_expanded.numpy(),
-                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                step=0,
-                slot_mappings=prefill_slot_mappings,
-            )
+                    query_start_loc_np=query_start_loc_cpu_expanded.numpy(),
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    step=0,
+                    slot_mappings=prefill_slot_mappings,
+                )
             prefill_slot_maps_by_layer = build_slot_mappings_by_layer(
                 prefill_slot_mappings, kv_cache_config
             )
@@ -238,6 +258,8 @@ class StandaloneARSpeculator(DraftModelSpeculator):
                 prefill_slot_maps_by_layer,
                 num_tokens_across_dp,
             )
+            if use_hybrid_replay:
+                self.hybrid_replay.commit()
             positions_buf = self.expanded_positions
 
         last_indices = self.last_token_indices[:num_reqs]
@@ -256,6 +278,7 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         self,
         input_batch: InputBatch,
         num_rejected: torch.Tensor,
+        use_hybrid_replay: bool,
         num_reqs: int,
         skip_attn: bool,
         num_tokens_across_dp: torch.Tensor | None,
@@ -274,7 +297,13 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         # Step 2 forward uses      target_seq_lens - num_rejected + 3.
         self.input_buffers.seq_lens[:num_reqs].copy_(
             torch.clamp(
-                input_batch.seq_lens[:num_reqs] - num_rejected[:num_reqs].int() + 1,
+                (
+                    last_positions + 1
+                    if use_hybrid_replay
+                    else input_batch.seq_lens[:num_reqs]
+                    - num_rejected[:num_reqs].int()
+                    + 1
+                ),
                 max=self.max_model_len,
             )
         )
@@ -386,9 +415,16 @@ class StandaloneARSpeculator(DraftModelSpeculator):
             seeds,
         )
 
+        use_hybrid_replay = (
+            self.hybrid_replay is not None
+            and self.hybrid_replay.enabled
+            and not dummy_run
+        )
         self._prefill(
             input_batch,
             num_rejected,
+            num_sampled,
+            use_hybrid_replay,
             last_sampled,
             num_reqs,
             skip_attn,
@@ -401,6 +437,7 @@ class StandaloneARSpeculator(DraftModelSpeculator):
         self._multi_step_decode(
             input_batch,
             num_rejected,
+            use_hybrid_replay,
             num_reqs,
             skip_attn,
             num_tokens_across_dp,

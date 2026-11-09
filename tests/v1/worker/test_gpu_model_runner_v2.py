@@ -390,7 +390,8 @@ def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_d
     speculator.speculative_config = SimpleNamespace(
         kv_cache_dtype=draft_dtype, draft_parallel_config=ParallelConfig()
     )
-    get_model = Mock(return_value=object())
+    speculator.max_num_reqs = 4
+    get_model = Mock(return_value=torch.nn.Module())
     monkeypatch.setattr(ar_module, "get_model", get_model)
     monkeypatch.setattr(ar_module, "set_model_tag", lambda _: contextlib.nullcontext())
 
@@ -400,3 +401,235 @@ def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_d
     assert draft_config.cache_config.cache_dtype == expected_dtype
     assert speculator.attn_vllm_config.cache_config.cache_dtype == expected_dtype
     assert target.cache_config.cache_dtype == "fp8_e4m3"
+
+
+# These tests use a tiny independently evaluated recurrence so an incorrect
+# restore/commit boundary cannot pass just by agreeing with another packer.
+class MambaMixer2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prefix = "draft.mamba"
+        self.kv_cache = (torch.zeros(8, 3, 2), torch.zeros(8, 2))
+
+    def get_state_shape(self):
+        return ((3, 2), (2,))
+
+    def get_state_dtype(self):
+        return (torch.float32, torch.float32)
+
+
+@pytest.fixture
+def recurrent_replay():
+    from vllm.v1.worker.gpu.spec_decode.standalone_ar.hybrid_replay import (
+        HybridDraftReplay,
+    )
+
+    layer = MambaMixer2()
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=False, mamba_cache_mode="none"
+        ),
+        model_config=SimpleNamespace(enforce_eager=True),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    owner = SimpleNamespace(
+        max_num_reqs=4,
+        device=torch.device("cpu"),
+        vllm_config=cfg,
+        draft_attn_layer_names={layer.prefix},
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=object.__new__(MambaSpec), layer_names=[layer.prefix]
+                )
+            ]
+        ),
+        block_tables=SimpleNamespace(
+            input_block_tables=[torch.tensor([[5], [1], [3], [0]])]
+        ),
+        expanded_input_ids=torch.zeros(128, dtype=torch.int32),
+        expanded_positions=torch.zeros(128, dtype=torch.int64),
+        input_buffers=SimpleNamespace(
+            query_start_loc=torch.zeros(5, dtype=torch.int32),
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        ),
+        last_token_indices=torch.zeros(4, dtype=torch.int64),
+        draft_is_prefilling=torch.zeros(4, dtype=torch.bool),
+    )
+    replay = HybridDraftReplay(owner, layer)
+    replay.bind()
+    return replay, owner, layer
+
+
+def _replay_batch(slots, segments, starts):
+    import numpy as np
+
+    lengths = [len(s) for s in segments]
+    return SimpleNamespace(
+        num_reqs=len(slots),
+        num_tokens=sum(lengths),
+        idx_mapping=torch.tensor(slots),
+        input_ids=torch.tensor(sum(segments, []), dtype=torch.int32),
+        positions=torch.tensor(
+            [p for start, n in zip(starts, lengths) for p in range(start, start + n)]
+        ),
+        query_start_loc_np=np.asarray([0, *np.cumsum(lengths)], dtype=np.int32),
+    )
+
+
+def _reference_recurrence(tokens, conv=None, ssm=None):
+    conv = torch.zeros(3, 2) if conv is None else conv.clone()
+    ssm = torch.zeros(2) if ssm is None else ssm.clone()
+    for t in tokens:
+        conv = torch.cat([conv[1:], torch.tensor([[float(t), float(t + 1)]])])
+        ssm = 0.5 * ssm + conv.sum(dim=0)
+    return conv, ssm
+
+
+def _apply_packed(replay, owner, layer, qsl):
+    for packed_row, original_row in enumerate(replay.order.tolist()):
+        block = int(owner.block_tables.input_block_tables[0][original_row, 0])
+        a, b = map(int, qsl[packed_row : packed_row + 2])
+        old = (
+            (None, None)
+            if bool(replay.prefilling[packed_row])
+            else tuple(c[block] for c in layer.kv_cache)
+        )
+        states = _reference_recurrence(owner.expanded_input_ids[a:b].tolist(), *old)
+        for cache, value in zip(layer.kv_cache, states):
+            cache[block].copy_(value)
+    replay.commit()
+
+
+@pytest.mark.parametrize("accepted", range(8))
+def test_committed_state_excludes_rejected_proposals(recurrent_replay, accepted):
+    replay, owner, layer = recurrent_replay
+    prompt = [1, 2, 3, 4, 5, 6]
+    first = _replay_batch([2], [prompt], [0])
+    _, qsl, _ = replay.prepare(
+        first, torch.tensor([0]), torch.tensor([1]), torch.tensor([0, 0, 70, 0])
+    )
+    _apply_packed(replay, owner, layer, qsl)
+    # A speculative transaction advances only the working cache.
+    for cache in layer.kv_cache:
+        cache[5].fill_(999)
+    proposed = list(range(20, 27))
+    nxt = _replay_batch([2], [[70] + proposed], [6])
+    total, qsl, _ = replay.prepare(
+        nxt,
+        torch.tensor([7 - accepted]),
+        torch.tensor([accepted + 1]),
+        torch.tensor([0, 0, 80, 0]),
+    )
+    assert owner.expanded_input_ids[:total].tolist() == proposed[:accepted] + [80]
+    _apply_packed(replay, owner, layer, qsl)
+    expected = _reference_recurrence(prompt + [70] + proposed[:accepted] + [80])
+    for cache, want in zip(layer.kv_cache, expected):
+        torch.testing.assert_close(cache[5], want)
+    assert replay.committed_end[2] == 8 + accepted
+
+
+def test_chunked_prefill_processes_each_token_once(recurrent_replay):
+    replay, owner, layer = recurrent_replay
+    for start, tokens, sampled in [(0, [1, 2, 3], 0), (3, [4, 5], 0), (5, [6, 7], 1)]:
+        batch = _replay_batch([1], [tokens], [start])
+        _, qsl, _ = replay.prepare(
+            batch,
+            torch.tensor([0]),
+            torch.tensor([sampled]),
+            torch.tensor([0, 99, 0, 0]),
+        )
+        _apply_packed(replay, owner, layer, qsl)
+        for c in layer.kv_cache:
+            c[5].fill_(-50)  # discarded speculative/intermediate working state
+    expected = _reference_recurrence([1, 2, 3, 4, 5, 6, 7, 99])
+    backups = replay.snapshots[layer.prefix][1]
+    for saved, want in zip(backups, expected):
+        torch.testing.assert_close(saved[1], want)
+
+
+def test_request_reordering_reuse_and_independent_states(recurrent_replay):
+    replay, owner, layer = recurrent_replay
+    batch = _replay_batch([2, 0], [[1, 2, 3], [4, 5]], [0, 0])
+    _, qsl, _ = replay.prepare(
+        batch, torch.tensor([0, 0]), torch.tensor([1, 1]), torch.tensor([90, 0, 80, 0])
+    )
+    _apply_packed(replay, owner, layer, qsl)
+    batch = _replay_batch(
+        [2, 0], [[80] + list(range(10, 17)), [90] + list(range(30, 37))], [3, 2]
+    )
+    _, qsl, _ = replay.prepare(
+        batch, torch.tensor([0, 7]), torch.tensor([8, 1]), torch.tensor([92, 0, 82, 0])
+    )
+    assert replay.order.tolist() == [1, 0]
+    assert owner.last_token_indices[:2].tolist() == [8, 0]
+    _apply_packed(replay, owner, layer, qsl)
+    owner.block_tables.input_block_tables[0][:2] = torch.tensor([[1], [5]])
+    batch = _replay_batch([0, 2], [[92, 12], [82, 13]], [3, 11])
+    _, qsl, _ = replay.prepare(
+        batch, torch.tensor([1, 1]), torch.tensor([1, 1]), torch.tensor([93, 0, 83, 0])
+    )
+    _apply_packed(replay, owner, layer, qsl)
+    expected = [
+        _reference_recurrence([4, 5, 90, 92, 93]),
+        _reference_recurrence([1, 2, 3, 80] + list(range(10, 17)) + [82, 83]),
+    ]
+    for block, states in zip([1, 5], expected):
+        for cache, want in zip(layer.kv_cache, states):
+            torch.testing.assert_close(cache[block], want)
+    batch = _replay_batch([0], [[11, 12]], [0])
+    _, qsl, _ = replay.prepare(
+        batch, torch.tensor([0]), torch.tensor([0]), torch.zeros(4)
+    )
+    _apply_packed(replay, owner, layer, qsl)
+    for cache, want in zip(layer.kv_cache, _reference_recurrence([11, 12])):
+        torch.testing.assert_close(cache[1], want)
+
+
+def test_snapshot_storage_preexists_cache_binding(recurrent_replay, monkeypatch):
+    replay, _, layer = recurrent_replay
+    assert replay.snapshot_bytes == 4 * (3 * 2 + 2) * 4
+    pointers = [s.data_ptr() for s in replay.snapshots[layer.prefix][1]]
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("binding must not allocate snapshot storage")
+
+    monkeypatch.setattr(torch, "empty", unexpected)
+    replay.layers.clear()
+    replay.bind()
+    assert pointers == [s.data_ptr() for s in replay.snapshots[layer.prefix][1]]
+
+
+def test_snapshot_allocation_is_visible_to_model_memory_profiler(recurrent_replay):
+    from vllm.utils.mem_utils import DeviceMemoryProfiler
+    from vllm.v1.worker.gpu.spec_decode.standalone_ar.hybrid_replay import (
+        HybridDraftReplay,
+    )
+
+    _, owner, layer = recurrent_replay
+    owner.device = torch.device("cuda")
+    with DeviceMemoryProfiler() as profile:
+        replay = HybridDraftReplay(owner, layer)
+    assert profile.consumed_memory >= replay.snapshot_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("prefix", True), ("eager", False), ("async", True), ("mode", "align")],
+)
+def test_recurrent_replay_rejects_unsupported_modes(recurrent_replay, field, value):
+    from vllm.v1.worker.gpu.spec_decode.standalone_ar.hybrid_replay import (
+        HybridDraftReplay,
+    )
+
+    _, owner, layer = recurrent_replay
+    settings = {
+        "prefix": (owner.vllm_config.cache_config, "enable_prefix_caching"),
+        "eager": (owner.vllm_config.model_config, "enforce_eager"),
+        "async": (owner.vllm_config.scheduler_config, "async_scheduling"),
+        "mode": (owner.vllm_config.cache_config, "mamba_cache_mode"),
+    }
+    obj, name = settings[field]
+    setattr(obj, name, value)
+    with pytest.raises(NotImplementedError, match="eager synchronous"):
+        HybridDraftReplay(owner, layer)
