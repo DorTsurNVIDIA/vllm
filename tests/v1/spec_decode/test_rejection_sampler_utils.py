@@ -371,6 +371,39 @@ def test_decision_kl_saturated_interior_length_keeps_reference_correction(block)
     assert torch.all((sampled[:, 1] == 1) | (sampled[:, 1] == 2))
 
 
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_random_length_preserves_conditional_correction(block):
+    """The length draw must not condition or reuse the correction RNG stream."""
+    torch.manual_seed(915)
+    n, k = 30000, 2
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.15, 0.35, 0.5, 0.0], device="cuda").log(),
+        torch.tensor([0.8, 0.02, 0.08, 0.1], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    inputs["draft_sampled"].view(n, k + 1)[:, 1:] = torch.tensor([0, 3], device="cuda")
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 0.1
+    ledger[:, 2] = 4
+    sampled, counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.all((counts == 1) | (counts == 2))
+    for length in [0, 1]:
+        selected = counts == length + 1
+        assert selected.sum().item() > 1000
+        correction = sampled[selected, length]
+        expected = 73 / 95 if block and length == 1 else 0.44
+        assert abs((correction == 1).float().mean().item() - expected) < 0.03
+        assert torch.all((correction == 1) | (correction == 2))
+
+
 def test_decision_kl_one_token_block_matches_token_relaxation():
     torch.manual_seed(121)
     n, k = 128, 1
