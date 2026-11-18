@@ -601,8 +601,15 @@ def _rejection_kernel(
     rejected_argmax = tl.full((), 0, tl.int64)
     target_lse = 0.0
     draft_lse = 0.0
+    forced_length = tl.full((), -1, tl.int64)
+    steps_to_verify = num_draft_tokens
+    if HAS_FORCED_LENGTH:
+        forced_length = tl.load(forced_lengths_ptr + req_idx).to(tl.int64)
+        # The conditional law has already selected L. Preserve the original
+        # correction sampler without repeating and discarding verifier coins.
+        steps_to_verify = tl.where(forced_length < 0, num_draft_tokens, 0)
     verifying = True
-    for i in range(num_draft_tokens):
+    for i in range(steps_to_verify):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
         # -1 is used for placeholder draft token ids that should be rejected.
@@ -763,14 +770,11 @@ def _rejection_kernel(
             rejected_argmax,
         )
 
-    forced_length = -1
-    if HAS_FORCED_LENGTH:
-        forced_length = tl.load(forced_lengths_ptr + req_idx).to(tl.int64)
-        if forced_length >= 0:
-            accepted_length = forced_length
-            for j in range(accepted_length):
-                token = tl.load(draft_sampled_ptr + start_idx + j + 1)
-                tl.store(sampled_ptr + req_idx * sampled_stride + j, token)
+    if HAS_FORCED_LENGTH and forced_length >= 0:
+        accepted_length = forced_length
+        for j in range(accepted_length):
+            token = tl.load(draft_sampled_ptr + start_idx + j + 1)
+            tl.store(sampled_ptr + req_idx * sampled_stride + j, token)
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
     if (
         (USE_BLOCK_VERIFICATION or forced_length >= 0)

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm import SamplingParams
+from vllm.exceptions import VLLMValidationError
 from vllm.v1.watermarking import GumbelWatermarker
 from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -238,20 +239,20 @@ def test_decision_kl_invalid_request_budget_is_rejected(epsilon):
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "kwargs,error_type",
     [
-        {"temperature": 0.0},
-        {"temperature": float("inf")},
-        {"max_tokens": None},
-        {"max_tokens": float("inf")},
-        {"n": 2},
+        ({"temperature": 0.0}, ValueError),
+        ({"temperature": float("inf")}, VLLMValidationError),
+        ({"max_tokens": None}, ValueError),
+        ({"max_tokens": float("inf")}, ValueError),
+        ({"n": 2}, ValueError),
     ],
 )
-def test_decision_kl_requires_finite_stochastic_single_completion(kwargs):
+def test_decision_kl_requires_finite_stochastic_single_completion(kwargs, error_type):
     from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
 
     state = DecisionKLState(1, "cuda")
-    with pytest.raises(ValueError):
+    with pytest.raises(error_type):
         params = SamplingParams(
             **dict({"max_tokens": 16, "temperature": 0.8}, **kwargs)
         )
@@ -288,6 +289,86 @@ def test_decision_kl_graph_replay_matches_eager_decisions_and_ledger():
     valid = torch.arange(k + 1, device="cuda")[None, :] < eager[1][:, None]
     assert torch.equal(eager[0][valid], captured[0][valid])
     assert torch.equal(ledger, expected_ledger)
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_tiny_supported_probability_can_saturate_with_sufficient_budget(
+    block,
+):
+    n, k = 64, 1
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([1e-30, 0.25, 0.75, 0.0], device="cuda").log(),
+        torch.tensor([0.99, 0.005, 0.005, 0.0], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    # Condition on a possible draft with extremely small target probability.
+    inputs["draft_sampled"].view(n, k + 1)[:, 1] = 0
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 10000
+    ledger[:, 2] = 32
+    sampled, counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.all(counts == 2)
+    assert torch.all(sampled[:, 0] == 0)
+    assert torch.all(sampled != 3)
+    # Saturation costs about -log(1e-30 / .99), rather than zero nats.
+    assert torch.all((ledger[:, 3] > 60) & (ledger[:, 3] < 80))
+    assert torch.all(ledger[:, 1] >= 0)
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_identical_scores_keep_zero_residual_reference(block):
+    n, k = 64, 3
+    logits = torch.tensor([0.3, 0.7, 0.0], device="cuda").log()
+    inputs = _build_rejection_sample_inputs(logits, logits, k, 1.0, n)
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 1
+    ledger[:, 2] = 32
+    sampled, counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.all(counts == k + 1)
+    assert torch.all(sampled != 2)
+    assert torch.all(ledger[:, 3:6] == torch.tensor([0, 1, 0], device="cuda"))
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_saturated_interior_length_keeps_reference_correction(block):
+    n, k = 20000, 2
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.15, 0.35, 0.5, 0.0], device="cuda").log(),
+        torch.tensor([0.8, 0.02, 0.08, 0.1], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    inputs["draft_sampled"].view(n, k + 1)[:, 1:] = torch.tensor([0, 3], device="cuda")
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 100
+    ledger[:, 2] = 4
+    sampled, counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.all(counts == 2)
+    assert torch.all(sampled[:, 0] == 0)
+    expected = 73 / 95 if block else 0.44
+    assert abs((sampled[:, 1] == 1).float().mean().item() - expected) < 0.02
+    assert torch.all((sampled[:, 1] == 1) | (sampled[:, 1] == 2))
 
 
 def test_decision_kl_one_token_block_matches_token_relaxation():
