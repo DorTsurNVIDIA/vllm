@@ -572,12 +572,14 @@ def _rejection_kernel(
     # [num_logits]
     fly_entropy_ptr,
     fly_entropy_threshold,
+    forced_lengths_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
     FLY_WINDOW_SIZE: tl.constexpr,
+    HAS_FORCED_LENGTH: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -756,8 +758,20 @@ def _rejection_kernel(
             rejected_argmax,
         )
 
+    forced_length = -1
+    if HAS_FORCED_LENGTH:
+        forced_length = tl.load(forced_lengths_ptr + req_idx)
+        if forced_length >= 0:
+            accepted_length = forced_length
+            for j in range(accepted_length):
+                token = tl.load(draft_sampled_ptr + start_idx + j + 1)
+                tl.store(sampled_ptr + req_idx * sampled_stride + j, token)
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
-    if USE_BLOCK_VERIFICATION and not is_greedy and accepted_length < num_draft_tokens:
+    if (
+        (USE_BLOCK_VERIFICATION or forced_length >= 0)
+        and not is_greedy
+        and accepted_length < num_draft_tokens
+    ):
         # Compute the target and draft log exponential sums for the
         # rejected token.
         rejected_idx = start_idx + accepted_length
@@ -873,6 +887,7 @@ def _resample_kernel(
     WATERMARK: tl.constexpr,
     DEDUPLICATE_CONTEXTS: tl.constexpr,
     SKIP_MASKED_BLOCKS: tl.constexpr,
+    TARGET_ONLY_RECOVERY: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     resample_idx = tl.load(rejected_step_ptr + req_idx)
@@ -939,7 +954,7 @@ def _resample_kernel(
             & (temp != 0.0)
         )
 
-    if is_bonus or not is_valid_rejected_draft:
+    if is_bonus or not is_valid_rejected_draft or TARGET_ONLY_RECOVERY:
         # Bonus token (no rejections) or -1 placeholder token. In either case,
         # directly use the target logits.
         residual_logits = target_logits
@@ -1155,6 +1170,14 @@ def rejection_sample(
     fly_entropy_threshold: float = 0.3,
     fly_entropy_top_k: int = 3,
     skip_masked_vocab_blocks: bool = False,
+    decision_ledger: torch.Tensor | None = None,
+    prompt_lens: torch.Tensor | None = None,
+    decision_progress: bool = False,
+    decision_audit: torch.Tensor | None = None,
+    decision_audit_width: int = 0,
+    cactus_delta: float = 0.0,
+    fsd_threshold: float | None = None,
+    fsd_statistic: str = "js",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     draft_logits = None
@@ -1167,6 +1190,21 @@ def rejection_sample(
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+    fsd_gates = None
+    if cactus_delta > 0 or fsd_threshold is not None:
+        from vllm.v1.worker.gpu.spec_decode.research_baselines import process_baseline
+
+        target_logits, fsd_gates = process_baseline(
+            target_logits,
+            draft_logits_cache,
+            draft_sampled,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            cactus_delta,
+            fsd_threshold,
+            fsd_statistic,
+        )
 
     watermark = contexts is not None
     assert watermark == (watermarking is not None) == (watermark_key is not None), (
@@ -1343,6 +1381,39 @@ def rejection_sample(
         cumulative_log_p = None
         local_residual_mass = None
 
+    forced_lengths = None
+    if decision_ledger is not None:
+        from vllm.v1.worker.gpu.spec_decode.decision_kl import select_lengths
+
+        forced_lengths = select_lengths(
+            decision_ledger,
+            prompt_lens,
+            target_logits,
+            draft_logits_cache,
+            draft_sampled,
+            cu_num_logits,
+            idx_mapping,
+            temperature,
+            seed,
+            pos,
+            cumulative_log_p,
+            local_residual_mass,
+            target_local_max,
+            target_local_sumexp,
+            draft_local_max,
+            draft_local_sumexp,
+            vocab_num_blocks,
+            num_speculative_steps,
+            use_block_verification,
+            decision_progress,
+            decision_audit,
+            decision_audit_width,
+        )
+    elif fsd_gates is not None:
+        from vllm.v1.worker.gpu.spec_decode.research_baselines import gate_lengths
+
+        forced_lengths = gate_lengths(fsd_gates, cu_num_logits)
+
     # Sample up until the first rejected/bonus token, and store
     # the step.
     sampled = draft_sampled.new_empty(
@@ -1385,12 +1456,14 @@ def rejection_sample(
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
         fly_entropy,
         fly_entropy_threshold,
+        forced_lengths,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
         FLY_WINDOW_SIZE=fly_window_size,
+        HAS_FORCED_LENGTH=forced_lengths is not None,
         num_warps=1,
     )
 
@@ -1442,6 +1515,7 @@ def rejection_sample(
         WATERMARK=watermark,
         DEDUPLICATE_CONTEXTS=watermarking_skip_mask is not None,
         SKIP_MASKED_BLOCKS=skip_masked_vocab_blocks,
+        TARGET_ONLY_RECOVERY=fsd_threshold is not None,
     )
 
     # Insert the resampled tokens into the output sampled.

@@ -1233,7 +1233,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_run(**batch, skip_eplb=True)
         self.adaptive_verification.set_initial_cost_curves(timings)
 
-    def _remove_request(self, req_id: str) -> bool:
+    def _remove_request(self, req_id: str, finished: bool = False) -> bool:
+        if self.rejection_sampler is not None:
+            state = getattr(self.rejection_sampler, "decision_state", None)
+            if state is not None:
+                state.remove(req_id, finished)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1266,7 +1270,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
         for req_id in sorted(finished_req_ids):
-            self._remove_request(req_id)
+            self._remove_request(
+                req_id, finished=req_id in scheduler_output.finished_req_ids
+            )
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1326,6 +1332,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
                 self.sampler.add_request(req_index, new_req_data.sampling_params)
+                if self.rejection_sampler is not None:
+                    state = getattr(self.rejection_sampler, "decision_state", None)
+                    if state is not None:
+                        state.add(
+                            req_id,
+                            req_index,
+                            new_req_data.sampling_params,
+                            resumed=len(new_req_data.prefill_token_ids) > prompt_len,
+                        )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params

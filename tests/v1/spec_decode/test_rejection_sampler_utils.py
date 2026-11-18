@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm import SamplingParams
 from vllm.v1.watermarking import GumbelWatermarker
 from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -127,6 +128,144 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_zero_budget_preserves_reference_draws(block):
+    """Zero budget must preserve native output and RNG use exactly."""
+    torch.manual_seed(17)
+    n, k = 64, 3
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.3, 0.7], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    native = _rejection_sample(
+        **inputs, num_speculative_steps=k, use_block_verification=block
+    )
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, 2] = 6
+    actual = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.equal(native[1], actual[1])
+    valid = torch.arange(k + 1, device="cuda")[None, :] < native[1][:, None]
+    assert torch.equal(native[0][valid], actual[0][valid])
+    assert torch.count_nonzero(ledger[:, 3]) == 0
+
+
+def test_decision_kl_binary_acceptance_and_budget():
+    """The audited binary example must gain AL without overspending."""
+    torch.manual_seed(42)
+    n, k = 20000, 3
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.3, 0.7], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 0.1
+    ledger[:, 2] = 6
+    _, count = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=True,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    assert abs((count - 1).double().mean().item() - 1.5759906298437836) < 0.04
+    assert torch.all(ledger[:, 3] <= 0.1 / 6)
+    assert torch.all(ledger[:, 1] >= 0)
+    assert torch.all(ledger[:, 5] == 0)
+
+
+def test_decision_kl_request_identity_survives_slot_reuse_and_lost_resume():
+    from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
+
+    state = DecisionKLState(2, "cuda")
+    params = SamplingParams(
+        temperature=0.8, max_tokens=6, extra_args={"spec_kl_epsilon": 0.1}
+    )
+    state.add("original", 0, params)
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.3, 0.7], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        3,
+        1.0,
+        1,
+    )
+    _rejection_sample(
+        **inputs,
+        num_speculative_steps=3,
+        use_block_verification=True,
+        decision_ledger=state.values,
+        prompt_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+    )
+    original = state.values[0].clone()
+    assert original[3] > 0
+    state.remove("original", finished=False)
+    state.add("replacement", 0, params)
+    assert state.values[0, 1] == 0.1
+    state.remove("replacement", finished=True)
+    state.add("original", 1, params, resumed=True)
+    assert torch.equal(state.values[1], original)
+    state.add("lost", 0, params, resumed=True)
+    assert state.values[0, 1] == 0
+
+
+@pytest.mark.parametrize("epsilon", [-1.0, float("inf"), float("nan")])
+def test_decision_kl_invalid_request_budget_is_rejected(epsilon):
+    from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
+
+    state = DecisionKLState(1, "cuda")
+    with pytest.raises(ValueError, match="finite nonnegative"):
+        state.add(
+            "bad",
+            0,
+            SamplingParams(
+                temperature=0.8, max_tokens=10, extra_args={"spec_kl_epsilon": epsilon}
+            ),
+        )
+
+
+def test_decision_kl_graph_replay_matches_eager_decisions_and_ledger():
+    torch.manual_seed(91)
+    n, k = 32, 3
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.3, 0.7], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    initial = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    initial[:, :2] = 0.1
+    initial[:, 2] = 6
+    ledger = initial.clone()
+    kwargs = dict(
+        num_speculative_steps=k,
+        use_block_verification=True,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    eager = _rejection_sample(**inputs, **kwargs, decision_ledger=ledger)
+    expected_ledger = ledger.clone()
+    ledger.copy_(initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _rejection_sample(**inputs, **kwargs, decision_ledger=ledger)
+    graph.replay()
+    assert torch.equal(eager[1], captured[1])
+    valid = torch.arange(k + 1, device="cuda")[None, :] < eager[1][:, None]
+    assert torch.equal(eager[0][valid], captured[0][valid])
+    assert torch.equal(ledger, expected_ledger)
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])

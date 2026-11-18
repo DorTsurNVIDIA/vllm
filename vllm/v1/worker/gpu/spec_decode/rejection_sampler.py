@@ -166,6 +166,22 @@ class RejectionSampler:
         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
+        self.research_method = rejection_sample_method
+        self.decision_kl_policy = spec_config.decision_kl_policy
+        self.cactus_delta = spec_config.cactus_delta
+        self.fsd_threshold = spec_config.fsd_threshold
+        self.fsd_statistic = spec_config.fsd_statistic
+        self.decision_state = None
+        if rejection_sample_method in ("block_kl", "token_kl", "cactus", "fsd"):
+            from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
+
+            self.decision_state = DecisionKLState(
+                sampler.req_states.max_num_reqs,
+                device,
+                spec_config.abv_trace_dir,
+                spec_config.abv_audit_dir,
+                self.num_speculative_steps,
+            )
         self.fly_window_size = 0
         self.fly_entropy_threshold = spec_config.fly_entropy_threshold
         self.fly_entropy_top_k = spec_config.fly_entropy_top_k
@@ -179,7 +195,7 @@ class RejectionSampler:
                 dtype=torch.float32,
                 device=device,
             )
-        elif rejection_sample_method == "block":
+        elif rejection_sample_method in ("block", "block_kl"):
             self.use_block_verification = True
         elif rejection_sample_method == "fly":
             assert spec_config.fly_window_size is not None
@@ -280,6 +296,25 @@ class RejectionSampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
         )
+        state = getattr(self, "decision_state", None)
+        research_kwargs = {}
+        if state is not None:
+            research_kwargs = {
+                "decision_ledger": state.values
+                if self.research_method in ("block_kl", "token_kl")
+                else None,
+                "prompt_lens": self.sampler.req_states.prompt_len.gpu,
+                "decision_progress": self.decision_kl_policy == "progress",
+                "decision_audit": state.audit,
+                "decision_audit_width": state.audit_width,
+                "cactus_delta": self.cactus_delta
+                if self.research_method == "cactus"
+                else 0,
+                "fsd_threshold": self.fsd_threshold
+                if self.research_method == "fsd"
+                else None,
+                "fsd_statistic": self.fsd_statistic,
+            }
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -295,6 +330,7 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            **research_kwargs,
             fly_window_size=self.fly_window_size,
             fly_entropy_threshold=self.fly_entropy_threshold,
             fly_entropy_top_k=self.fly_entropy_top_k,
@@ -305,6 +341,19 @@ class RejectionSampler:
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
         )
+        if state is not None and state.audit_dir:
+            assert draft_logits is not None
+            state.capture(
+                idx_mapping_np,
+                target=processed_logits,
+                draft=draft_logits.values,
+                sampled=draft_sampled,
+                cu=cu_num_logits,
+                mapping=idx_mapping,
+                temperature=self.sampler.sampling_states.temperature.gpu,
+                draft_row_mapping=draft_logits.row_mapping,
+                block=self.use_block_verification,
+            )
         if self.sampler.trace_replay_state is not None:
             self.sampler.trace_replay_state.apply_trace_to_verified(
                 sampled, num_sampled, draft_sampled, cu_num_logits, idx_mapping

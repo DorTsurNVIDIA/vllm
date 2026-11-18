@@ -1,0 +1,27 @@
+Research implementation provenance
+
+Base engine: vLLM v0.34.0, Apache-2.0, commit
+62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
+
+The exact block kernel, its normalization, cumulative-ratio calculation,
+residual reductions, and correction sampler are upstream vLLM code, based on
+Sun et al., Block Verification Accelerates Speculative Decoding,
+https://arxiv.org/abs/2403.10444 . Upstream standard, block, and FLy paths
+are retained. The new implementation is a research fork, not an upstream release.
+
+Cactus equations are ported from Hao and Mou, Cactus: Accelerating
+Auto-Regressive Decoding with Constrained Acceptance Speculative Sampling,
+https://arxiv.org/abs/2604.04987 . Published implementation:
+https://github.com/MANGA-UOFA/Cactus/tree/3b01b816d18bf1e02ce93d0c5d43b42d8814427b .
+This port implements the published Taylor candidate-mass approximation,
+candidate-conditioned surrogate, and positive-part recovery distribution.
+
+FSD equations follow Holsman, Huang, and Dhingra, Fuzzy Speculative Decoding
+for a Tunable Accuracy-Runtime Tradeoff, https://arxiv.org/abs/2502.20704 .
+The main statistic is the paper's JS. The separately labeled released_js
+pilot sensitivity reflects https://github.com/maxholsman/fsd and is not JS.
+
+The finite-model reference prototype and derivation were supplied by the
+user's earlier agent. The independent Fraction audit, integration, controller,
+and research note were prepared with OpenAI Codex assistance. No novelty,
+machine-rigorous floating-point certificate, or measured speedup is claimed.

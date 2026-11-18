@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -102,6 +104,76 @@ cases = [
 def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runner):
     args.enforce_eager = enforce_eager
     assert_draft_model_correctness(args, vllm_runner)
+
+
+@pytest.mark.parametrize("method", ["block_kl", "token_kl"])
+@pytest.mark.parametrize("enforce_eager", [True, False])
+@single_gpu_only
+def test_decision_kl_request_ledger_through_llm(
+    method, enforce_eager, vllm_runner, tmp_path
+):
+    """Real requests carry distinct budgets through generation and final cleanup."""
+    revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    with vllm_runner(
+        "Qwen/Qwen3-0.6B",
+        revision=revision,
+        tokenizer_revision=revision,
+        dtype="bfloat16",
+        generation_config="vllm",
+        max_model_len=512,
+        max_num_seqs=2,
+        enforce_eager=enforce_eager,
+        enable_prefix_caching=False,
+        speculative_config={
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-0.6B",
+            "revision": revision,
+            "num_speculative_tokens": 3,
+            "draft_sample_method": "probabilistic",
+            "enable_adaptive_verification": False,
+            "rejection_sample_method": method,
+            "abv_trace_dir": str(tmp_path),
+        },
+    ) as runner:
+        tokenizer = runner.llm.get_tokenizer()
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Count to ten."}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        params = [
+            SamplingParams(
+                n=1,
+                temperature=0.8,
+                top_p=1,
+                top_k=0,
+                min_p=0,
+                max_tokens=17,
+                ignore_eos=True,
+                seed=12,
+                extra_args={"spec_kl_epsilon": epsilon},
+            )
+            for epsilon in [0.0, 0.1]
+        ]
+        outputs = runner.llm.generate([text, text], params, use_tqdm=False)
+        runner.llm.generate(
+            text,
+            SamplingParams(
+                temperature=0.8, max_tokens=1, extra_args={"spec_kl_epsilon": 0.0}
+            ),
+            use_tqdm=False,
+        )
+        for result, epsilon in zip(outputs, [0.0, 0.1]):
+            assert len(result.outputs[0].token_ids) == 17
+            path = tmp_path / (
+                hashlib.sha256(result.request_id.encode()).hexdigest() + ".json"
+            )
+            ledger = json.loads(path.read_text())
+            assert ledger["epsilon"] == epsilon
+            assert 0 <= ledger["charged_kl"] <= epsilon
+            assert 0 <= ledger["remaining"] <= epsilon
+            assert epsilon - ledger["remaining"] == ledger["charged_kl"]
 
 
 @single_gpu_only

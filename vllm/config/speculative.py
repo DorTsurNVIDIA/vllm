@@ -95,7 +95,9 @@ SpeculativeMethod = Literal[
     NgramGPUTypes,
     DSparkModelTypes,
 ]
-RejectionSampleMethod = Literal["standard", "synthetic", "block", "fly"]
+RejectionSampleMethod = Literal[
+    "standard", "synthetic", "block", "fly", "block_kl", "token_kl", "cactus", "fsd"
+]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
@@ -616,6 +618,19 @@ class SpeculativeConfig:
     block instead of one at a time. 'fly' applies FLy's lossy, entropy-gated
     deferred window to the native per-token acceptance decisions."""
 
+    decision_kl_policy: Literal["uniform", "progress"] = "uniform"
+    """Allocation of request-wide decision KL in nats; research-only."""
+    cactus_delta: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    """Published Cactus Taylor-rule parameter; not a request KL budget."""
+    fsd_threshold: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    """Strict divergence threshold for FSD draft acceptance."""
+    fsd_statistic: Literal["js", "released_js"] = "js"
+    """Paper JS, or the released-source statistic for pilot sensitivity."""
+    abv_trace_dir: str | None = None
+    """Optional final request-ledger output directory in this research fork."""
+    abv_audit_dir: str | None = None
+    """Optional score-row snapshots for separate numerical-audit jobs."""
+
     synthetic_acceptance_rates: list[float] | None = None
     """Per-position *unconditional* acceptance rates for synthetic rejection
     sampling. Position i's entry is the marginal probability that the first
@@ -748,6 +763,12 @@ class SpeculativeConfig:
             "suffix_decoding_min_token_prob",
             "draft_load_config",
             "rejection_sample_method",
+            "decision_kl_policy",
+            "cactus_delta",
+            "fsd_threshold",
+            "fsd_statistic",
+            "abv_trace_dir",
+            "abv_audit_dir",
             "synthetic_acceptance_rates",
             "synthetic_acceptance_length",
             "enable_adaptive_verification",
@@ -1644,6 +1665,11 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.rejection_sample_method in ("block_kl", "token_kl", "cactus", "fsd"):
+            if self.draft_sample_method != "probabilistic":
+                raise ValueError("Research verifiers require probabilistic drafting")
+            if self.enable_adaptive_verification:
+                raise ValueError("Research verifiers require fixed draft lengths")
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
