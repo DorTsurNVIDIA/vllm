@@ -352,7 +352,7 @@ def _select_length(
         # Engineering margin for upstream FP32 score reductions, calibrated
         # against extended-precision real-row audits. This is not a certified
         # floating-point error bound. At unresolved budgets use the reference.
-        guard = 1e-10 + 1e-4 * tldevice.sqrt(allowance) + 1e-6 * allowance
+        guard = 1e-10 + 1e-3 * tldevice.sqrt(allowance) + 1e-6 * allowance
         usable = tl.maximum(0.0, allowance - guard)
         lengths = indices.to(tl.float64) - k
         maximum = tl.max(tl.where(log_pi > float("-inf"), indices, -1), 0)
