@@ -150,6 +150,12 @@ def _fixed_draft_counts(model_runner: GPUModelRunner) -> Iterator[None]:
     adaptive_verification = model_runner.adaptive_verification
     model_runner.adaptive_verification = None
     rejection_sampler = model_runner.rejection_sampler
+    # Internal warmups deliberately exercise truncated/greedy sampling. They
+    # have no request budget and must not enter research request validation.
+    decision_state = getattr(rejection_sampler, "decision_state", None)
+    if decision_state is not None:
+        assert rejection_sampler is not None
+        rejection_sampler.decision_state = None
     adaptive_sampling = (
         rejection_sampler is not None and rejection_sampler.enable_adaptive_verification
     )
@@ -160,6 +166,9 @@ def _fixed_draft_counts(model_runner: GPUModelRunner) -> Iterator[None]:
         yield
     finally:
         model_runner.adaptive_verification = adaptive_verification
+        if decision_state is not None:
+            assert rejection_sampler is not None
+            rejection_sampler.decision_state = decision_state
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True

@@ -1192,12 +1192,53 @@ class SamplingParams(
         if speculative_config is None:
             return
 
+        if speculative_config.rejection_sample_method in (
+            "block_kl",
+            "token_kl",
+            "cactus",
+            "fsd",
+        ):
+            self._validate_request_kl()
+
         # Some sampling parameters are not yet compatible with spec decoding.
         if self.min_p > _SAMPLING_EPS or self.logit_bias:
             raise VLLMValidationError(
                 "The min_p and logit_bias sampling parameters "
                 "are not yet supported with speculative decoding."
             )
+
+    def _validate_request_kl(self) -> None:
+        """Validate before n-completion fanout, and again on the GPU worker."""
+        epsilon = (self.extra_args or {}).get("spec_kl_epsilon", 0.0)
+        try:
+            valid_budget = math.isfinite(epsilon) and epsilon >= 0
+        except TypeError:
+            valid_budget = False
+        if not valid_budget:
+            raise ValueError("spec_kl_epsilon must be finite nonnegative nats")
+        if (
+            self.n != 1
+            or not isinstance(self.max_tokens, int)
+            or isinstance(self.max_tokens, bool)
+            or self.max_tokens < 1
+            or not math.isfinite(self.temperature)
+            or self.temperature <= 0
+        ):
+            raise ValueError(
+                "Decision KL requires n=1, finite max_tokens, temperature>0"
+            )
+        if (
+            self.top_p != 1
+            or self.top_k not in (0, -1)
+            or self.min_p != 0
+            or self.presence_penalty != 0
+            or self.frequency_penalty != 0
+            or self.repetition_penalty != 1
+            or self.structured_outputs is not None
+            or self.trace_decode_token_ids is not None
+            or self.watermarking is True
+        ):
+            raise ValueError("Initial decision-KL study supports untruncated sampling")
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:
         if not model_config.is_diffusion:

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -14,6 +16,9 @@ from vllm.v1.worker.gpu.spec_decode.draft_logits import (
     draft_logits_row,
 )
 from vllm.v1.worker.gpu.spec_decode.fly import compute_fly_entropy
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.research_timing import ComponentTiming
 
 
 @triton.jit
@@ -760,7 +765,7 @@ def _rejection_kernel(
 
     forced_length = -1
     if HAS_FORCED_LENGTH:
-        forced_length = tl.load(forced_lengths_ptr + req_idx)
+        forced_length = tl.load(forced_lengths_ptr + req_idx).to(tl.int64)
         if forced_length >= 0:
             accepted_length = forced_length
             for j in range(accepted_length):
@@ -1178,6 +1183,7 @@ def rejection_sample(
     cactus_delta: float = 0.0,
     fsd_threshold: float | None = None,
     fsd_statistic: str = "js",
+    component_timing: "ComponentTiming | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     draft_logits = None
@@ -1385,6 +1391,8 @@ def rejection_sample(
     if decision_ledger is not None:
         from vllm.v1.worker.gpu.spec_decode.decision_kl import select_lengths
 
+        if component_timing is not None:
+            component_timing.start("solve")
         forced_lengths = select_lengths(
             decision_ledger,
             prompt_lens,
@@ -1409,6 +1417,8 @@ def rejection_sample(
             decision_audit,
             decision_audit_width,
         )
+        if component_timing is not None:
+            component_timing.stop("solve")
     elif fsd_gates is not None:
         from vllm.v1.worker.gpu.spec_decode.research_baselines import gate_lengths
 

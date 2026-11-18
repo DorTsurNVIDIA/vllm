@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Research-only decision-KL sampler. Ideal guarantee is documented separately."""
 
+import gzip
 import hashlib
 import json
-import math
 from pathlib import Path
+from typing import TypedDict
 
 import torch
 
@@ -17,6 +18,12 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 )
 
 
+class TraceMetadata(TypedDict):
+    logical_id: str
+    skip: bool
+    lost_restore: bool
+
+
 class DecisionKLState:
     """GPU ledger, preserved by request ID through worker slot preemption."""
 
@@ -25,6 +32,8 @@ class DecisionKLState:
         self.values = torch.zeros((max_reqs, 8), dtype=torch.float64, device=device)
         self.saved = {}
         self.owners = {}
+        self.metadata: dict[str, TraceMetadata] = {}
+        self.exported: set[str] = set()
         self.trace_dir = trace_dir
         self.audit_dir = audit_dir
         self.audit_width = k + 1
@@ -34,35 +43,50 @@ class DecisionKLState:
             else None
         )
         self.score_snapshots = {}
+        self.audit_history = {}
+        self.capture_counts = {}
 
     def capture(self, slots, **tensors):
         if self.audit_dir:
+            assert self.audit is not None
             snapshot = {
                 key: value.clone() if isinstance(value, torch.Tensor) else value
                 for key, value in tensors.items()
             }
             for slot in slots:
-                self.score_snapshots[int(slot)] = snapshot
+                slot = int(slot)
+                capture_index = self.capture_counts.get(slot, 0)
+                entry = dict(
+                    snapshot,
+                    audit_version=2,
+                    slot=slot,
+                    width=self.audit_width,
+                    decision=self.audit[slot].clone(),
+                    ledger=self.values[slot].clone(),
+                    capture_index=capture_index,
+                )
+                if capture_index < 8:
+                    self.audit_history.setdefault(slot, []).append(entry)
+                self.score_snapshots[slot] = entry
+                self.capture_counts[slot] = capture_index + 1
 
     def add(self, req_id, slot, params, resumed=False):
+        params._validate_request_kl()
         epsilon = (params.extra_args or {}).get("spec_kl_epsilon", 0.0)
-        if not math.isfinite(epsilon) or epsilon < 0:
-            raise ValueError("spec_kl_epsilon must be finite nonnegative nats")
-        if params.n != 1 or not params.max_tokens or params.temperature <= 0:
-            raise ValueError("Decision KL requires n=1, max_tokens, temperature>0")
-        if (
-            params.top_p != 1
-            or params.top_k not in (0, -1)
-            or params.min_p != 0
-            or params.presence_penalty != 0
-            or params.frequency_penalty != 0
-            or params.repetition_penalty != 1
-            or params.structured_outputs is not None
-        ):
-            raise ValueError("Initial decision-KL study supports untruncated sampling")
         self.owners[req_id] = slot
+        previous_metadata = self.metadata.get(req_id)
+        lost_restore = (resumed and req_id not in self.saved) or (
+            previous_metadata is not None and previous_metadata["lost_restore"]
+        )
+        self.metadata[req_id] = {
+            "logical_id": str((params.extra_args or {}).get("abv_logical_id", req_id)),
+            "skip": bool((params.extra_args or {}).get("abv_skip_trace", False)),
+            "lost_restore": bool(lost_restore),
+        }
         if self.audit is not None:
             self.audit[slot].zero_()
+            self.audit_history[slot] = []
+            self.capture_counts[slot] = 0
         if req_id in self.saved:
             self.values[slot].copy_(self.saved.pop(req_id))
         else:
@@ -70,7 +94,7 @@ class DecisionKLState:
                 epsilon,
                 0.0 if resumed else epsilon,
                 params.max_tokens,
-                0,
+                epsilon if resumed else 0,
                 0,
                 int(resumed),
                 -1,
@@ -80,63 +104,97 @@ class DecisionKLState:
                 torch.tensor(row, dtype=torch.float64, device=self.values.device)
             )
 
-    def remove(self, req_id, finished):
-        slot = self.owners.pop(req_id, None)
-        if slot is not None and finished and self.audit_dir:
+    def export(self, req_id):
+        """Export once after completion; allowed at a request-boundary control RPC."""
+        slot = self.owners.get(req_id)
+        if slot is None or self.metadata[req_id]["skip"]:
+            return None
+        logical_id = self.metadata[req_id]["logical_id"]
+        name = hashlib.sha256(logical_id.encode()).hexdigest()
+        path = Path(self.trace_dir) / (name + ".json") if self.trace_dir else None
+        if req_id in self.exported:
+            return str(path) if path else None
+        if self.audit_dir:
             assert self.audit is not None
-            snapshot = self.score_snapshots.pop(slot, None)
-            if snapshot is not None:
+            snapshots = list(self.audit_history.get(slot, []))
+            last = self.score_snapshots.get(slot)
+            if last is not None and not any(last is item for item in snapshots):
+                snapshots.append(last)
+            for snapshot in snapshots:
                 snapshot = {
                     key: value.cpu() if isinstance(value, torch.Tensor) else value
                     for key, value in snapshot.items()
                 }
                 snapshot.update(
-                    slot=slot,
                     request_id=req_id,
-                    decision=self.audit[slot].cpu(),
-                    width=self.audit_width,
-                    ledger=self.values[slot].cpu(),
+                    logical_request_id=logical_id,
                 )
                 destination = Path(self.audit_dir)
                 destination.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    snapshot,
-                    destination / (hashlib.sha256(req_id.encode()).hexdigest() + ".pt"),
+                with gzip.open(
+                    destination / (name + f"-r{snapshot['capture_index']:05d}.pt.gz"),
+                    "wb",
+                    compresslevel=3,
+                ) as stream:
+                    torch.save(snapshot, stream)
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            values = self.values[slot].cpu().tolist()
+            path.write_text(
+                json.dumps(
+                    {
+                        "request_id": req_id,
+                        "logical_request_id": logical_id,
+                        "prior_cost_unknown": self.metadata[req_id]["lost_restore"],
+                        **dict(
+                            zip(
+                                [
+                                    "epsilon",
+                                    "remaining",
+                                    "horizon",
+                                    "charged_kl",
+                                    "rounds",
+                                    "fallbacks",
+                                    "last_length",
+                                    "last_conditional_kl",
+                                ],
+                                values,
+                            )
+                        ),
+                    }
                 )
+                + "\n"
+            )
+        self.exported.add(req_id)
+        return str(path) if path else None
+
+    def export_logical(self, logical_id):
+        for req_id, metadata in self.metadata.items():
+            if metadata["logical_id"] == logical_id:
+                return self.export(req_id)
+        if self.trace_dir:
+            path = Path(self.trace_dir) / (
+                hashlib.sha256(logical_id.encode()).hexdigest() + ".json"
+            )
+            if path.exists():
+                return str(path)
+        return None
+
+    def remove(self, req_id, finished):
+        slot = self.owners.get(req_id)
         if slot is not None:
-            row = self.values[slot].clone()
-            if not finished:
-                self.saved[req_id] = row
-            elif self.trace_dir:
-                destination = Path(self.trace_dir)
-                destination.mkdir(parents=True, exist_ok=True)
-                values = row.cpu().tolist()
-                name = hashlib.sha256(req_id.encode()).hexdigest()
-                (destination / (name + ".json")).write_text(
-                    json.dumps(
-                        {
-                            "request_id": req_id,
-                            **dict(
-                                zip(
-                                    [
-                                        "epsilon",
-                                        "remaining",
-                                        "horizon",
-                                        "charged_kl",
-                                        "rounds",
-                                        "fallbacks",
-                                        "last_length",
-                                        "last_conditional_kl",
-                                    ],
-                                    values,
-                                )
-                            ),
-                        }
-                    )
-                    + "\n"
-                )
+            if finished:
+                self.export(req_id)
+            else:
+                self.saved[req_id] = self.values[slot].clone()
+            self.score_snapshots.pop(slot, None)
+            self.audit_history.pop(slot, None)
+            self.capture_counts.pop(slot, None)
+            self.owners.pop(req_id, None)
         if finished:
             self.saved.pop(req_id, None)
+            self.metadata.pop(req_id, None)
+            self.exported.discard(req_id)
 
 
 @triton.jit
@@ -248,30 +306,32 @@ def _select_length(
                 log_a = tl.full((), float("-inf"), tl.float64)
                 if i < k:
                     token = tl.load(sampled + start + i + 1)
-                    lp, lq, _, _ = _compute_global_logprobs_and_logsumexp(
-                        token,
-                        True,
-                        start + i,
-                        slot,
-                        i,
-                        temp,
-                        target,
-                        target_stride,
-                        target_max,
-                        tms,
-                        target_sum,
-                        tss,
-                        draft,
-                        ds0,
-                        ds1,
-                        row_mapping,
-                        draft_max,
-                        dms,
-                        draft_sum,
-                        dss,
-                        vocab_blocks,
-                        PAD_V,
-                        True,
+                    lp, lq, _target_lse, _draft_lse = (
+                        _compute_global_logprobs_and_logsumexp(
+                            token,
+                            True,
+                            start + i,
+                            slot,
+                            i,
+                            temp,
+                            target,
+                            target_stride,
+                            target_max,
+                            tms,
+                            target_sum,
+                            tss,
+                            draft,
+                            ds0,
+                            ds1,
+                            row_mapping,
+                            draft_max,
+                            dms,
+                            draft_sum,
+                            dss,
+                            vocab_blocks,
+                            PAD_V,
+                            True,
+                        )
                     )
                     log_a = tl.minimum((lp - lq).to(tl.float64), 0.0)
                 mass = survival + tldevice.log1p(-tldevice.exp(log_a))
@@ -289,34 +349,46 @@ def _select_length(
             allowance = tl.minimum(
                 budget, budget * (1 + mean) / tl.maximum(horizon - t, 1)
             )
-        guard = 1e-12 + 1e-6 * allowance
+        # Engineering margin for upstream FP32 score reductions, calibrated
+        # against extended-precision real-row audits. This is not a certified
+        # floating-point error bound. At unresolved budgets use the reference.
+        guard = 1e-10 + 1e-4 * tldevice.sqrt(allowance) + 1e-6 * allowance
         usable = tl.maximum(0.0, allowance - guard)
         lengths = indices.to(tl.float64) - k
         maximum = tl.max(tl.where(log_pi > float("-inf"), indices, -1), 0)
         limit = -tl.sum(tl.where(indices == maximum, log_pi, 0.0), 0)
         lo = tl.full((), 0.0, tl.float64)
-        hi = tl.full((), 1.0, tl.float64)
-        _, hi_cost = _tilted(log_pi, lengths, hi)
-        for _ in range(32):
-            if hi_cost < usable:
-                hi *= 2
-                _, hi_cost = _tilted(log_pi, lengths, hi)
-        bracketed = (hi_cost >= usable) | (usable >= limit)
-        for _ in range(64):
-            mid = (lo + hi) / 2
-            _, cost = _tilted(log_pi, lengths, mid)
-            feasible = cost <= usable
-            lo = tl.where(feasible, mid, lo)
-            hi = tl.where(feasible, hi, mid)
-        pi, cost = _tilted(log_pi, lengths, lo)
-        if usable >= limit:
+        pi = base
+        cost = tl.full((), 0.0, tl.float64)
+        bracketed = tl.full((), True, tl.int1)
+        if usable >= limit and limit > 0:
             pi = (indices == maximum).to(tl.float64)
             cost = limit
+            lo = tl.full((), float("inf"), tl.float64)
+        elif usable > 0 and limit > 0:
+            hi = tl.full((), 1.0, tl.float64)
+            _hi_pi, hi_cost = _tilted(log_pi, lengths, hi)
+            for _bracket_step in range(32):
+                if hi_cost < usable:
+                    hi *= 2
+                    _hi_pi, hi_cost = _tilted(log_pi, lengths, hi)
+            bracketed = (hi_cost >= usable) | (usable >= limit)
+            for _bisect_step in range(64):
+                mid = (lo + hi) / 2
+                _mid_pi, cost = _tilted(log_pi, lengths, mid)
+                feasible = (cost <= usable) & (cost + guard <= allowance)
+                lo = tl.where(feasible, mid, lo)
+                hi = tl.where(feasible, hi, mid)
+            pi, cost = _tilted(log_pi, lengths, lo)
+        charged = tl.where(cost > 0, cost + guard, 0.0)
         valid = (
             bracketed
             & (cost == cost)
             & (cost <= usable)
+            & (charged <= allowance)
+            & (charged <= budget)
             & (allowance > guard)
+            & (cost > 0)
             & (tl.abs(tl.sum(pi, 0) - 1.0) < 1e-10)
         )
         if audit is not None:
@@ -328,18 +400,20 @@ def _select_length(
             tl.store(offset + 2 * AUDIT_WIDTH + 2, usable)
             tl.store(offset + 2 * AUDIT_WIDTH + 3, k)
             tl.store(offset + 2 * AUDIT_WIDTH + 4, valid.to(tl.float64))
+            tl.store(offset + 2 * AUDIT_WIDTH + 5, guard)
+            tl.store(offset + 2 * AUDIT_WIDTH + 6, charged)
+            tl.store(offset + 2 * AUDIT_WIDTH + 7, allowance)
         if valid:
             seed = spec_step_seed(tl.load(seeds + slot), 20261118)
             u = tl_rand32(seed, tl.load(positions + start), includes_zero=False)
             length = tl.sum((tl.cumsum(pi, 0) < u).to(tl.int32), 0)
             length = tl.minimum(length, k)
-            charged = tl.where(cost > 0, cost + guard, 0.0)
             tl.store(forced + r, length)
             tl.store(ledger + slot * 8 + 1, budget - charged)
             tl.store(ledger + slot * 8 + 3, epsilon - (budget - charged))
             tl.store(ledger + slot * 8 + 6, length)
             tl.store(ledger + slot * 8 + 7, cost)
-        else:
+        elif limit != 0:
             tl.store(ledger + slot * 8 + 5, tl.load(ledger + slot * 8 + 5) + 1)
         tl.store(ledger + slot * 8 + 4, tl.load(ledger + slot * 8 + 4) + 1)
 

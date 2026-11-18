@@ -142,6 +142,12 @@ def test_decision_kl_request_ledger_through_llm(
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        with pytest.raises(ValueError, match="n=1"):
+            runner.llm.generate(
+                text,
+                SamplingParams(n=2, temperature=0.8, max_tokens=17),
+                use_tqdm=False,
+            )
         params = [
             SamplingParams(
                 n=1,
@@ -152,7 +158,10 @@ def test_decision_kl_request_ledger_through_llm(
                 max_tokens=17,
                 ignore_eos=True,
                 seed=12,
-                extra_args={"spec_kl_epsilon": epsilon},
+                extra_args={
+                    "spec_kl_epsilon": epsilon,
+                    "abv_logical_id": f"epsilon-{epsilon}",
+                },
             )
             for epsilon in [0.0, 0.1]
         ]
@@ -167,7 +176,7 @@ def test_decision_kl_request_ledger_through_llm(
         for result, epsilon in zip(outputs, [0.0, 0.1]):
             assert len(result.outputs[0].token_ids) == 17
             path = tmp_path / (
-                hashlib.sha256(result.request_id.encode()).hexdigest() + ".json"
+                hashlib.sha256(f"epsilon-{epsilon}".encode()).hexdigest() + ".json"
             )
             ledger = json.loads(path.read_text())
             assert ledger["epsilon"] == epsilon

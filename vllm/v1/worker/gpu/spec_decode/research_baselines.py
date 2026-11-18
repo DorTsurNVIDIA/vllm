@@ -37,7 +37,8 @@ def process_baseline(
         hn = (pn + (2 * delta * pn * (1 - pn)).sqrt()).clamp_max(1)
         h = p * ((1 - hn) / (1 - pn)).nan_to_num(nan=1)[:, None]
         h.scatter_(1, token[:, None], hn[:, None])
-        result = torch.where(bonus[:, None], target.float(), h.log())
+        active = ~bonus & (raw_token >= 0)
+        result = torch.where(active[:, None], h.log(), target.float())
         return result, None
     lm = torch.logaddexp(lp, lq) - 0.6931471805599453
     if statistic == "js":
@@ -47,7 +48,7 @@ def process_baseline(
     else:
         m = lm.exp()
         d = 0.5 * torch.where(m > 0, m * (2 * lm - lp - lq), 0).sum(-1)
-    return target, (d < fsd_threshold) & ~bonus & (raw_token >= 0)
+    return target, (d.clamp_min(0) < fsd_threshold) & ~bonus & (raw_token >= 0)
 
 
 @triton.jit

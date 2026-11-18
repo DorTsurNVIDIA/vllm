@@ -67,9 +67,20 @@ by target recovery at the first failed gate, following
 `abv_trace_dir` optionally writes a final request-ledger record. Tracing performs
 a CPU transfer when a request is removed; exclude trace-export cost from any
 isolated kernel microbenchmark and report its effect in end-to-end latency.
-`abv_audit_dir` additionally snapshots the last processed score rows and the
+`abv_audit_dir` additionally snapshots early and final processed score rows and the
 conditional length calculation. Use this only for separate numerical-audit
 jobs, since copying vocabulary rows changes memory traffic and timing.
+The study harness supplies `extra_args["abv_logical_id"]` to join traces across
+engine restarts and suppresses warmup traces with `abv_skip_trace`. Finished
+requests may export their ledger at a request-boundary control RPC; no round
+requires a CPU transfer.
+An unrestored request records epsilon as a conservative charge and sets
+`prior_cost_unknown`, then continues with the exact reference verifier.
+
+The broker study harness uses named worker-extension RPCs for request-boundary
+diagnostics. Optional component GPU events run in separate diagnostic jobs;
+their wall time is excluded from the main latency frontier. Internal engine
+startup warmups use the reference verifier without a research request ledger.
 
 See `research/abv` for the pre-run theory note, provenance, broker-only launch
 controller, reproducible synthetic checks, and experiment gates.

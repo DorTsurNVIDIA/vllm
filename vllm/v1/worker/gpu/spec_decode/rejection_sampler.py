@@ -314,6 +314,7 @@ class RejectionSampler:
                 if self.research_method == "fsd"
                 else None,
                 "fsd_statistic": self.fsd_statistic,
+                "component_timing": getattr(self, "abv_timing", None),
             }
         sampled, num_sampled = rejection_sample(
             processed_logits,

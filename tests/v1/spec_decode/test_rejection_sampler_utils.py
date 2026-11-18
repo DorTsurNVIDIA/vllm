@@ -202,6 +202,7 @@ def test_decision_kl_request_identity_survives_slot_reuse_and_lost_resume():
         1.0,
         1,
     )
+    inputs["draft_sampled"].view(1, 4)[:, 1:] = 0
     _rejection_sample(
         **inputs,
         num_speculative_steps=3,
@@ -236,6 +237,27 @@ def test_decision_kl_invalid_request_budget_is_rejected(epsilon):
         )
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": 0.0},
+        {"temperature": float("inf")},
+        {"max_tokens": None},
+        {"max_tokens": float("inf")},
+        {"n": 2},
+    ],
+)
+def test_decision_kl_requires_finite_stochastic_single_completion(kwargs):
+    from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
+
+    state = DecisionKLState(1, "cuda")
+    with pytest.raises(ValueError):
+        params = SamplingParams(
+            **dict({"max_tokens": 16, "temperature": 0.8}, **kwargs)
+        )
+        state.add("request", 0, params)
+
+
 def test_decision_kl_graph_replay_matches_eager_decisions_and_ledger():
     torch.manual_seed(91)
     n, k = 32, 3
@@ -266,6 +288,172 @@ def test_decision_kl_graph_replay_matches_eager_decisions_and_ledger():
     valid = torch.arange(k + 1, device="cuda")[None, :] < eager[1][:, None]
     assert torch.equal(eager[0][valid], captured[0][valid])
     assert torch.equal(ledger, expected_ledger)
+
+
+def test_decision_kl_one_token_block_matches_token_relaxation():
+    torch.manual_seed(121)
+    n, k = 128, 1
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.1, 0.3, 0.6], device="cuda").log(),
+        torch.tensor([0.6, 0.3, 0.1], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    initial = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    initial[:, :2] = 0.1
+    initial[:, 2] = 6
+    ledgers = [initial.clone(), initial.clone()]
+    outputs = [
+        _rejection_sample(
+            **inputs,
+            num_speculative_steps=k,
+            use_block_verification=block,
+            decision_ledger=ledger,
+            prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+        )
+        for block, ledger in zip([False, True], ledgers)
+    ]
+    assert torch.equal(outputs[0][1], outputs[1][1])
+    valid = torch.arange(k + 1, device="cuda")[None, :] < outputs[0][1][:, None]
+    assert torch.equal(outputs[0][0][valid], outputs[1][0][valid])
+    assert torch.equal(ledgers[0], ledgers[1])
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_decision_kl_point_target_never_changes_supported_outputs(block):
+    torch.manual_seed(19)
+    n, k = 128, 4
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([1.0, 0.0], device="cuda").log(),
+        torch.tensor([0.5, 0.5], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    ledger = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    ledger[:, :2] = 10.0
+    ledger[:, 2] = 32
+    sampled, counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        use_block_verification=block,
+        decision_ledger=ledger,
+        prompt_lens=torch.zeros(n, dtype=torch.int32, device="cuda"),
+    )
+    valid = torch.arange(k + 1, device="cuda")[None, :] < counts[:, None]
+    assert torch.all(sampled[valid] == 0)
+    assert torch.all(ledger[:, 3] == 0)
+
+
+@pytest.mark.parametrize("progress", [False, True])
+def test_decision_kl_chunking_preserves_request_decisions_and_budgets(progress):
+    torch.manual_seed(33)
+    n, k = 8, 4
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.3, 0.7], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        k,
+        1.0,
+        n,
+    )
+    initial = torch.zeros(n, 8, dtype=torch.float64, device="cuda")
+    initial[:, :2] = torch.linspace(0.0, 1.0, n, device="cuda", dtype=torch.float64)[
+        :, None
+    ]
+    initial[:, 2] = 32
+    prompt_lens = inputs["pos"].view(n, k + 1)[:, 0] + 1
+    whole_ledger, chunk_ledger = initial.clone(), initial.clone()
+    kwargs = dict(
+        num_speculative_steps=k,
+        use_block_verification=True,
+        decision_progress=progress,
+        prompt_lens=prompt_lens,
+    )
+    whole, counts = _rejection_sample(**inputs, **kwargs, decision_ledger=whole_ledger)
+    for i in range(n):
+        part = dict(inputs)
+        for name in [
+            "target_logits",
+            "draft_sampled",
+            "pos",
+            "expanded_idx_mapping",
+            "expanded_local_pos",
+        ]:
+            part[name] = inputs[name][i * (k + 1) : (i + 1) * (k + 1)]
+        part["idx_mapping"] = inputs["idx_mapping"][i : i + 1]
+        part["cu_num_logits"] = inputs["cu_num_logits"][i : i + 2] - i * (k + 1)
+        sampled, count = _rejection_sample(
+            **part, **kwargs, decision_ledger=chunk_ledger
+        )
+        assert torch.equal(count, counts[i : i + 1])
+        assert torch.equal(sampled[0, : count[0]], whole[i, : counts[i]])
+    assert torch.equal(chunk_ledger, whole_ledger)
+
+
+def test_research_fsd_paper_js_and_released_statistic_have_distinct_gates():
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.0, 1.0], device="cuda").log(),
+        torch.tensor([0.5, 0.5], device="cuda").log(),
+        3,
+        1.0,
+        64,
+    )
+    _, paper_counts = _rejection_sample(
+        **inputs, num_speculative_steps=3, fsd_threshold=1.0, fsd_statistic="js"
+    )
+    recovered, released_counts = _rejection_sample(
+        **inputs,
+        num_speculative_steps=3,
+        fsd_threshold=1.0,
+        fsd_statistic="released_js",
+    )
+    assert torch.all(paper_counts == 4)
+    assert torch.all(released_counts == 1)
+    assert torch.all(recovered[:, 0] == 1)
+
+
+def test_research_cactus_taylor_rule_and_recovery_match_candidate_surrogate():
+    n = 20000
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.25, 0.75], device="cuda").log(),
+        torch.tensor([1.0, 0.0], device="cuda").log(),
+        1,
+        1.0,
+        n,
+    )
+    sampled, counts = _rejection_sample(
+        **inputs, num_speculative_steps=1, cactus_delta=0.5
+    )
+    expected = 0.25 + math.sqrt(2 * 0.5 * 0.25 * 0.75)
+    assert abs((counts - 1).float().mean().item() - expected) < 0.02
+    assert abs((sampled[:, 0] == 0).float().mean().item() - expected) < 0.02
+
+
+def test_research_cactus_placeholder_recovers_the_original_target():
+    inputs = _build_rejection_sample_inputs(
+        torch.tensor([0.25, 0.75], device="cuda").log(),
+        torch.tensor([0.7, 0.3], device="cuda").log(),
+        1,
+        1.0,
+        20000,
+    )
+    inputs["draft_sampled"].view(-1, 2)[:, 1] = -1
+    sampled, counts = _rejection_sample(
+        **inputs, num_speculative_steps=1, cactus_delta=1.0
+    )
+    assert torch.all(counts == 1)
+    assert abs((sampled[:, 0] == 0).float().mean().item() - 0.25) < 0.02
+
+
+def test_research_fsd_strict_zero_threshold_rejects_identical_distributions():
+    torch.manual_seed(918)
+    logits = torch.randn(31, device="cuda")
+    inputs = _build_rejection_sample_inputs(logits, logits, 3, 1.0, 128)
+    _, counts = _rejection_sample(
+        **inputs, num_speculative_steps=3, fsd_threshold=0.0, fsd_statistic="js"
+    )
+    assert torch.all(counts == 1)
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])

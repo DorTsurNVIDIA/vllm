@@ -2130,6 +2130,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if getattr(self, "abv_collect_target_calls", False):
+            self.abv_target_calls = getattr(self, "abv_target_calls", 0) + 1
+        component_timing = getattr(self, "abv_timing", None)
+        if component_timing is not None:
+            component_timing.start("target")
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2179,6 +2185,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if component_timing is not None:
+            component_timing.stop("target")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2279,9 +2287,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        component_timing = getattr(self, "abv_timing", None)
+        if component_timing is not None:
+            component_timing.start("verify")
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if component_timing is not None:
+            component_timing.stop("verify")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2372,6 +2385,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if component_timing is not None:
+                component_timing.start("draft")
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.prepare_propose(
                     input_batch, num_sampled, num_rejected, self.sampler
@@ -2407,6 +2422,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+            if component_timing is not None:
+                component_timing.stop("draft")
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
