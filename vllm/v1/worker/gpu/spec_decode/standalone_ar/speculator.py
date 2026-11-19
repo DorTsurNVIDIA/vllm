@@ -177,7 +177,7 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
     def _sample_prefill_drafts(
         self, hidden_states: torch.Tensor, positions: torch.Tensor, num_reqs: int
     ) -> None:
-        self.draft_tokens[:num_reqs, 0] = self.sample_draft(
+        draft_tokens = self.sample_draft(
             hidden_states[self.last_token_indices[:num_reqs]],
             positions[self.last_token_indices[:num_reqs]],
             self.idx_mapping[:num_reqs],
@@ -185,6 +185,9 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
             self.seeds,
             self.current_draft_step,
             self.draft_logits,
+        )
+        self.draft_tokens[:num_reqs, 0] = draft_tokens.masked_fill(
+            self.idx_mapping[:num_reqs] < 0, 0
         )
 
     def _prefill(
@@ -225,8 +228,8 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
         else:
             last_positions = self.expanded_positions[self.last_token_indices[:num_reqs]]
 
-        self.input_buffers.input_ids[:num_reqs_padded].copy_(
-            self.draft_tokens[:num_reqs_padded, 0].int()
+        self.input_buffers.input_ids[:num_reqs].copy_(
+            self.draft_tokens[:num_reqs, 0].int()
         )
         self.input_buffers.positions[:num_reqs].copy_(
             torch.clamp(last_positions + 1, max=self.max_model_len - 1)
@@ -241,6 +244,9 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
         )
 
         if num_reqs_padded > num_reqs:
+            # An absent row may retain a -1 draft marker. Attention ignores
+            # its empty query, but the embedding still reads its input ID.
+            self.input_buffers.input_ids[num_reqs:num_reqs_padded].zero_()
             self.input_buffers.seq_lens[num_reqs:num_reqs_padded].zero_()
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         query_start_loc[: num_reqs + 1].copy_(self.arange_gpu[: num_reqs + 1])
@@ -279,6 +285,7 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
             self.current_draft_step,
             self.draft_logits,
         )
+        draft_tokens.masked_fill_(self.idx_mapping[:num_reqs] < 0, 0)
 
         self.draft_tokens[:num_reqs].scatter_(
             1,

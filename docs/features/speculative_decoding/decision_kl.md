@@ -80,6 +80,12 @@ Fresh FP64 ledger rows are initialized directly on the GPU. This avoids the
 temporary host-to-device row allocation during request admission; saved rows
 still restore through the same GPU copy.
 
+Standalone autoregressive drafting initializes inactive decode input rows to
+valid token IDs and clears sampled tokens for negative request mappings.
+Empty attention queries still pass through the embedding, so draft markers
+such as `-1` must not enter those rows. Real request tokens and their sampling
+randomness retain the upstream computation.
+
 The broker study harness uses named worker-extension RPCs for request-boundary
 diagnostics. Optional component GPU events run in separate diagnostic jobs;
 their wall time is excluded from the main latency frontier. Internal engine
