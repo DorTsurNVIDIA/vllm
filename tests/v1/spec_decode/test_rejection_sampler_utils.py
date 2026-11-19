@@ -223,6 +223,40 @@ def test_decision_kl_request_identity_survives_slot_reuse_and_lost_resume():
     assert state.values[0, 1] == 0
 
 
+@pytest.mark.parametrize("epsilon", [0.0, 0.0008, 0.01, 0.1, 1.0, 10.0])
+@pytest.mark.parametrize("horizon", [1, 64, 2048])
+@pytest.mark.parametrize("resumed", [False, True])
+def test_decision_kl_initializer_preserves_fp64_layout(epsilon, horizon, resumed):
+    """GPU fills retain the exact bits of the previous row constructor."""
+    from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState
+
+    state = DecisionKLState(32, "cuda")
+    state.add(
+        "request",
+        31,
+        SamplingParams(
+            temperature=0.8, max_tokens=horizon, extra_args={"spec_kl_epsilon": epsilon}
+        ),
+        resumed=resumed,
+    )
+    expected = torch.tensor(
+        [
+            epsilon,
+            0.0 if resumed else epsilon,
+            horizon,
+            epsilon if resumed else 0.0,
+            0,
+            int(resumed),
+            -1,
+            0,
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    assert torch.equal(state.values[31].view(torch.int64), expected.view(torch.int64))
+    assert torch.count_nonzero(state.values[:31]) == 0
+
+
 @pytest.mark.parametrize("epsilon", [-1.0, float("inf"), float("nan")])
 def test_decision_kl_invalid_request_budget_is_rejected(epsilon):
     from vllm.v1.worker.gpu.spec_decode.decision_kl import DecisionKLState

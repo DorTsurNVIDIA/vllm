@@ -76,6 +76,9 @@ requests may export their ledger at a request-boundary control RPC; no round
 requires a CPU transfer.
 An unrestored request records epsilon as a conservative charge and sets
 `prior_cost_unknown`, then continues with the exact reference verifier.
+Fresh FP64 ledger rows are initialized directly on the GPU. This avoids the
+temporary host-to-device row allocation during request admission; saved rows
+still restore through the same GPU copy.
 
 The broker study harness uses named worker-extension RPCs for request-boundary
 diagnostics. Optional component GPU events run in separate diagnostic jobs;

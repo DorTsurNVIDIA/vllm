@@ -108,9 +108,10 @@ def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runne
 
 @pytest.mark.parametrize("method", ["block_kl", "token_kl"])
 @pytest.mark.parametrize("enforce_eager", [True, False])
+@pytest.mark.parametrize("num_requests", [2, 32])
 @single_gpu_only
 def test_decision_kl_request_ledger_through_llm(
-    method, enforce_eager, vllm_runner, tmp_path
+    method, enforce_eager, num_requests, vllm_runner, tmp_path
 ):
     """Real requests carry distinct budgets through generation and final cleanup."""
     revision = "c1899de289a04d12100db370d81485cdf75e47ca"
@@ -120,15 +121,17 @@ def test_decision_kl_request_ledger_through_llm(
         tokenizer_revision=revision,
         dtype="bfloat16",
         generation_config="vllm",
-        max_model_len=512,
-        max_num_seqs=2,
+        max_model_len=4096 if num_requests == 32 else 512,
+        max_num_seqs=num_requests,
+        max_num_batched_tokens=16384,
+        enable_chunked_prefill=True,
         enforce_eager=enforce_eager,
         enable_prefix_caching=False,
         speculative_config={
             "method": "draft_model",
             "model": "Qwen/Qwen3-0.6B",
             "revision": revision,
-            "num_speculative_tokens": 3,
+            "num_speculative_tokens": 16 if num_requests == 32 else 3,
             "draft_sample_method": "probabilistic",
             "enable_adaptive_verification": False,
             "rejection_sample_method": method,
@@ -137,7 +140,12 @@ def test_decision_kl_request_ledger_through_llm(
     ) as runner:
         tokenizer = runner.llm.get_tokenizer()
         text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Count to ten."}],
+            [
+                {
+                    "role": "user",
+                    "content": "Count to ten. " * (200 if num_requests == 32 else 1),
+                }
+            ],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -148,6 +156,28 @@ def test_decision_kl_request_ledger_through_llm(
                 SamplingParams(n=2, temperature=0.8, max_tokens=17),
                 use_tqdm=False,
             )
+        if num_requests == 32:
+            # Reuse request slots through the short-output graph boundaries
+            # before admitting a full batch with mixed request budgets.
+            for i in range(50):
+                width = i % 32 + 1
+                warmup = [
+                    SamplingParams(
+                        temperature=0.8,
+                        max_tokens=i % 18 + 1,
+                        ignore_eos=True,
+                        seed=1000 + i * 32 + j,
+                        extra_args={"spec_kl_epsilon": 0.1, "abv_skip_trace": True},
+                    )
+                    for j in range(width)
+                ]
+                runner.llm.generate([text] * width, warmup, use_tqdm=False)
+        budgets = [0.0, 0.0008, 0.01, 0.1, 1.0, 10.0]
+        budgets = (
+            [0.0, 0.1]
+            if num_requests == 2
+            else [budgets[i % len(budgets)] for i in range(num_requests)]
+        )
         params = [
             SamplingParams(
                 n=1,
@@ -160,12 +190,12 @@ def test_decision_kl_request_ledger_through_llm(
                 seed=12,
                 extra_args={
                     "spec_kl_epsilon": epsilon,
-                    "abv_logical_id": f"epsilon-{epsilon}",
+                    "abv_logical_id": f"request-{i}",
                 },
             )
-            for epsilon in [0.0, 0.1]
+            for i, epsilon in enumerate(budgets)
         ]
-        outputs = runner.llm.generate([text, text], params, use_tqdm=False)
+        outputs = runner.llm.generate([text] * num_requests, params, use_tqdm=False)
         runner.llm.generate(
             text,
             SamplingParams(
@@ -173,10 +203,10 @@ def test_decision_kl_request_ledger_through_llm(
             ),
             use_tqdm=False,
         )
-        for result, epsilon in zip(outputs, [0.0, 0.1]):
+        for i, (result, epsilon) in enumerate(zip(outputs, budgets)):
             assert len(result.outputs[0].token_ids) == 17
             path = tmp_path / (
-                hashlib.sha256(f"epsilon-{epsilon}".encode()).hexdigest() + ".json"
+                hashlib.sha256(f"request-{i}".encode()).hexdigest() + ".json"
             )
             ledger = json.loads(path.read_text())
             assert ledger["epsilon"] == epsilon

@@ -90,19 +90,15 @@ class DecisionKLState:
         if req_id in self.saved:
             self.values[slot].copy_(self.saved.pop(req_id))
         else:
-            row = [
-                epsilon,
-                0.0 if resumed else epsilon,
-                params.max_tokens,
-                epsilon if resumed else 0,
-                0,
-                int(resumed),
-                -1,
-                0,
-            ]
-            self.values[slot].copy_(
-                torch.tensor(row, dtype=torch.float64, device=self.values.device)
-            )
+            # Initialize the persistent FP64 row without a temporary H2D tensor.
+            row = self.values[slot]
+            row.zero_()
+            row[0].fill_(epsilon)
+            row[1].fill_(0.0 if resumed else epsilon)
+            row[2].fill_(params.max_tokens)
+            row[3].fill_(epsilon if resumed else 0.0)
+            row[5].fill_(int(resumed))
+            row[6].fill_(-1.0)
 
     def export(self, req_id):
         """Export once after completion; allowed at a request-boundary control RPC."""
